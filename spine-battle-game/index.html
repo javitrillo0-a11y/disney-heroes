@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>BRIGADA BOGO · Modo Batalla</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <canvas id="bg"></canvas>
+  <canvas id="spine"></canvas>
+  <canvas id="fx"></canvas>
+  <div id="grain"></div>
+  <div id="vignette"></div>
+
+  <header id="hud" class="hidden">
+    <div class="hud-left">
+      <span id="hudLevel" class="chip">NIVEL 1</span>
+      <span id="hudWave" class="chip chip-wave">OLEADA 1/3</span>
+    </div>
+    <div class="hud-right">
+      <span id="hudCoins" class="chip chip-gold">🪙 0</span>
+      <button id="btnAuto"  class="hbtn" title="Ultis automáticas (A)">AUTO</button>
+      <button id="btnSpeed" class="hbtn" title="Velocidad (V)">1×</button>
+      <button id="btnSound" class="hbtn hbtn-on" title="Sonido (S)">🔊</button>
+      <button id="btnPause" class="hbtn" title="Pausa (Espacio)">⏸</button>
+    </div>
+  </header>
+
+  <div id="banner" class="hidden"><span id="bannerText"></span></div>
+  <div id="tip" class="hidden">⚡ Energía llena → toca el retrato (o <b>1·2·3</b>) para lanzar la <b>ULTI</b></div>
+  <footer id="cards" class="hidden"></footer>
+
+  <!-- ══ MENÚ / BOOT ══ -->
+  <section id="boot">
+    <div class="boot-panel">
+      <div class="hazard"></div>
+      <div class="brand">
+        <svg class="badge" viewBox="0 0 64 64" aria-hidden="true">
+          <path d="M32 3l7 6 9-1 2 9 8 5-4 9 4 9-8 5-2 9-9-1-7 6-7-6-9 1-2-9-8-5 4-9-4-9 8-5 2-9 9 1z" fill="#f2b632" stroke="#8a5a00" stroke-width="2"/>
+          <circle cx="32" cy="32" r="15" fill="#0c1626"/>
+          <path d="M32 21l3.2 6.6 7.3 1-5.3 5.1 1.3 7.2-6.5-3.4-6.5 3.4 1.3-7.2-5.3-5.1 7.3-1z" fill="#ffd76a"/>
+        </svg>
+        <div>
+          <h1>BRIGADA <em>BOGO</em></h1>
+          <p class="sub">MODO BATALLA · SPINE 3.6 · ESCUADRÓN DOBLE</p>
+        </div>
+      </div>
+      <p class="flavor">Tres oleadas. Un escudo antidisturbios. Un chico más rápido que una bala.
+      Carga energía con cada golpe y suelta la <b>ULTI</b> en el momento justo.</p>
+
+      <div class="field">
+        <label>DIFICULTAD</label>
+        <div class="seg" id="diffRow">
+          <button data-d="easy">Fácil</button>
+          <button data-d="normal" class="on">Normal</button>
+          <button data-d="hard">Difícil</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>ASSETS DE HÉROES (JSON + ATLAS + PNG)</label>
+        <div class="drop-row">
+          <div id="drop0" class="drop drop-slot">
+            <div class="drop-icon">🛡️</div>
+            <p><b>BOGO</b><br><span class="dim">guardián · tanque</span></p>
+            <button class="btn btn-ghost small" data-slot="0">ELEGIR ARCHIVOS</button>
+            <p id="st0" class="status">Buscando en assets/…</p>
+          </div>
+          <div id="drop1" class="drop drop-slot">
+            <div class="drop-icon">⚡</div>
+            <p><b>DASH</b><br><span class="dim">velocista · DPS</span></p>
+            <button class="btn btn-ghost small" data-slot="1">ELEGIR ARCHIVOS</button>
+            <p id="st1" class="status">Buscando en assets/dash/…</p>
+          </div>
+        </div>
+        <p id="rtStatus" class="status dim">Runtime Spine: conectando…</p>
+        <p class="note">Renombra <code>.atlas.txt</code> → <code>.atlas</code> (opcional: el juego acepta ambos).
+        Carpetas: <code>assets/bogo/</code> y <code>assets/dash/</code>. ¿Doble clic? Arrastra cada trío a su zona.
+        Tip offline: <code>spine-webgl.js</code> (rama 3.6) dentro de <code>js/</code>.</p>
+      </div>
+
+      <button id="btnStart" class="btn btn-primary">▶ DESPLEGAR ESCUADRÓN <span id="startMode" class="tag">VECTOR</span></button>
+      <button id="btnVector" class="btn btn-ghost small">Jugar en modo vector (sin assets)</button>
+
+      <div class="legend">
+        <span><b>1·2·3</b> ulti</span><span><b>Espacio</b> pausa</span><span><b>A</b> auto</span>
+        <span><b>V</b> velocidad</span><span><b>S</b> sonido</span>
+      </div>
+      <p id="bootProgress" class="progress">Nivel 1 · 🪙 0 · Récord: Nivel 1</p>
+      <div class="hazard"></div>
+    </div>
+    <div class="boot-stage">
+      <span id="showAnim" class="chip chip-anim">idle</span>
+      <span class="stage-hint">Toca al personaje para probar animaciones</span>
+    </div>
+  </section>
+
+  <!-- ══ PAUSA ══ -->
+  <section id="pause" class="overlay hidden">
+    <div class="modal">
+      <div class="hazard"></div>
+      <h2>PAUSA</h2>
+      <label class="check"><input type="checkbox" id="flipChk"> Invertir orientación de sprites</label>
+      <button id="btnResume"  class="btn btn-primary">REANUDAR</button>
+      <button id="btnRestart" class="btn btn-ghost">REINICIAR NIVEL</button>
+      <button id="btnQuit"    class="btn btn-ghost">ABANDONAR</button>
+      <div class="hazard"></div>
+    </div>
+  </section>
+
+  <!-- ══ RESULTADO ══ -->
+  <section id="result" class="overlay hidden">
+    <div class="modal modal-result">
+      <div class="hazard"></div>
+      <h2 id="resTitle">VICTORIA</h2>
+      <div id="resStars" class="stars"><span>★</span><span>★</span><span>★</span></div>
+      <div id="resStats" class="stats"></div>
+      <p id="resCoins" class="coins">+0 🪙</p>
+      <button id="btnNext"  class="btn btn-primary">SIGUIENTE NIVEL ▶</button>
+      <button id="btnRetry" class="btn btn-ghost">REPETIR</button>
+      <button id="btnMenu"  class="btn btn-ghost">MENÚ</button>
+      <div class="hazard"></div>
+    </div>
+  </section>
+
+  <div id="toast" class="hidden"></div>
+  <input id="fileInput" type="file" multiple accept=".json,.atlas,.txt,.png,.jpg,.webp" hidden>
+</div>
+<script src="js/game.js"></script>
+</body>
+</html>
