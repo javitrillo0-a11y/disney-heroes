@@ -211,7 +211,7 @@ async function loadRuntime() {
         G.spineOK = initSpineGL();
         if (G.spineOK) {
           st.textContent = 'Runtime Spine 3.6 ✓ ' + (url.startsWith('.') ? '(local)' : '(CDN)');
-          st.className = 'status ok'; tryBuildSkeleton(); refreshStartMode(); return;
+          st.className = "status ok"; autoDetect(); refreshStartMode(); return;
         }
       }
     } catch (e) { /* siguiente */ }
@@ -220,90 +220,257 @@ async function loadRuntime() {
   st.className = 'status err'; refreshStartMode();
 }
 
-/* ── assets: autodetección + arrastrar/soltar + selector ── */
-const AssetIn = { json: null, atlas: null, image: null, imageName: '' };
-let skelData = null, glTexture = null, portraitURL = null;
+/* ══ ASSETS SPINE: BOGO + DASH (json + atlas + png) ══════════════════
+   Cada héroe tiene su propio trío de archivos en assets/<nombre>/.
+   Los enemigos usan el mismo esqueleto pero con otro skin («hero-flip»).
+   Por eso buildSkeleton() genera dos SkeletonData por héroe.            */
+const HEROES = [
+  { key: 'bogo', label: 'BOGO', icon: '🛡️', dir: 'assets/bogo/',
+    file: 'unit-DEFAULT-untrimmed-smallcombat', slot: 0 },
+  { key: 'dash', label: 'DASH', icon: '⚡', dir: 'assets/dash/',
+    file: 'unit-DEFAULT-untrimmed-smallcombat', slot: 1 }
+];
+const ANIM_ALIASES = {
+  victory_start: ['victory_start', 'victory', 'skill3_start'],
+  victory_loop:  ['victory_loop', 'victory', 'idle'],
+  skill3_start:  ['skill3_start', 'skill1', 'attack'],
+  skill3_loop:   ['skill3_loop', 'skill1', 'idle'],
+  skill3_end:    ['skill3_end', 'skill2_end', 'idle'],
+  entrance_end:  ['entrance_end', 'entrance_loop', 'idle']
+};
+/* hero[key] = { json, atlas, image, imageName, skelData, skelAlt, tex, portrait } */
+const hero = {};
+HEROES.forEach(h => hero[h.key] = { json: null, atlas: null, image: null, imageName: '',
+  skelData: null, skelAlt: null, tex: null, portrait: null });
 
-function classifyFile(name, text) {
-  const n = name.toLowerCase();
-  if (n.endsWith('.json') || (text && text.trim().startsWith('{') && text.includes('"skeleton"'))) return 'json';
-  if (n.includes('.atlas') || (text && /^\s*\S+\s*\nsize:\s*\d+/m.test(text) && text.includes('xy:'))) return 'atlas';
+let skelData = null, glTexture = null, portraitURL = null; /* retro-compatibilidad */
+
+function heroFromName(n) {
+  const s = String(n || '').toLowerCase();
+  if (s.includes('dash')) return 'dash';
+  if (s.includes('bogo')) return 'bogo';
   return null;
 }
-function ingestFile(file) {
+function classifyFile(name, text) {
+  const n = name.toLowerCase();
+  if (n.endsWith('.json') || (text && text.trim().charAt(0) === '{' && text.indexOf('"skeleton"') >= 0)) return 'json';
+  if (n.indexOf('.atlas') >= 0 || n.endsWith('.atlas.txt') ||
+      (text && /^\s*\S+\s*\nsize:\s*\d+/m.test(text) && text.indexOf('xy:') >= 0)) return 'atlas';
+  return null;
+}
+/* normaliza el JSON: skin real = «hero», «default» puede venir vacío */
+function normalizeJson(j) {
+  if (!j || !j.skins) return j;
+  const d = j.skins.default, h = j.skins.hero;
+  const empty = !d || !Object.keys(d).length;
+  if (h && empty) j.skins.default = h;                 /* todo dentro de default */
+  else if (h && d) for (const k in h) if (!d[k]) d[k] = h[k]; /* fusiona huecos */
+  if (!j.skins.hero) j.skins.hero = j.skins.default;
+  return j;
+}
+function atlasRegions(txt) {
+  const set = {}, lines = String(txt).split(/\r?\n/);
+  for (let i = 0; i < lines.length - 1; i++) {
+    const nm = lines[i].trim(), nx = lines[i + 1];
+    if (!nm || /^\s/.test(lines[i])) continue;
+    if (/^size:/i.test(nx.trim()) || /^rotate:/i.test(nx.trim())) set[nm.split(' ').join('')] = true;
+  }
+  return set;
+}
+/* recorta del atlas sólo las regiones que el JSON realmente usa
+   (evita fallos si el .png va corto de alguna región huérfana) */
+function pruneAtlas(atlasTxt, json) {
+  try {
+    const used = {};
+    const skins = (json && json.skins) || {};
+    for (const s in skins) { const sk = skins[s] || {};
+      for (const slot in sk) { const at = sk[slot] || {};
+        for (const an in at) { const v = at[an];
+          if (v && typeof v === 'object' && v.type === 'linkedmesh') continue;
+          used[((v && v.name) || an)] = true; } } }
+    if (!Object.keys(used).length) return atlasTxt;
+    const out = [], head = [];
+    const lines = String(atlasTxt).split(/\r?\n/);
+    let i = 0;
+    while (i < lines.length && !/^[^:\s]+\.png/i.test(lines[i]) && !/^size:/i.test(lines[i].trim())) head.push(lines[i++]);
+    while (i < lines.length && /^size:/i.test(lines[i].trim())) head.push(lines[i++]);
+    for (const f of ['format:', 'filter:', 'repeat:'])
+      while (i < lines.length && lines[i].indexOf(f) === 0) head.push(lines[i++]);
+    out.push(head.join('\n'));
+    while (i < lines.length) {
+      const nm = (lines[i] || '').trim(); let j = i + 1;
+      if (!nm) { i++; continue; }
+      while (j < lines.length && lines[j].charAt(0) === ' ') j++;
+      const blk = lines.slice(i, j).join('\n');
+      if (used[nm]) out.push(blk);
+      i = j;
+    }
+    const res = out.join('\n');
+    return (res.match(/^\S+$/gm) || []).length > 4 ? res : String(atlasTxt);
+  } catch (e) { return String(atlasTxt); }
+}
+function findRegionRect(atlasTxt, names) {
+  const lines = String(atlasTxt).split(/\r?\n/);
+  for (const want of names) {
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() !== want) continue;
+      let rot = false, xy = null, size = null;
+      for (let k = i + 1; k < lines.length && k <= i + 6; k++) {
+        const l = lines[k]; if (!/^\s/.test(l)) break;
+        if (/rotate:\s*true/i.test(l)) rot = true;
+        const mxy = l.match(/xy:\s*(-?\d+)\s*,\s*(-?\d+)/), ms = l.match(/size:\s*(\d+)\s*,\s*(\d+)/);
+        if (mxy) xy = [+mxy[1], +mxy[2]]; if (ms) size = [+ms[1], +ms[2]];
+      }
+      if (xy && size) return { x: xy[0], y: xy[1], w: size[0], h: size[1], rotate: rot };
+    }
+  }
+  return null;
+}
+function buildHero(key) {
+  const H = hero[key];
+  if (!(H.json && H.atlas && H.image)) return false;
+  if (!G.spineOK || !gl || glLost) return false;
+  normalizeJson(H.json);
+  if (!H.tex) H.tex = new spine.webgl.GLTexture(gl, H.image);
+  const mk = data => {
+    const atlas = new spine.TextureAtlas(pruneAtlas(H.atlas, H.json), () => H.tex);
+    const loader = new spine.AtlasAttachmentLoader(atlas);
+    const sj = new spine.SkeletonJson(loader); sj.scale = 1;
+    return sj.readSkeletonData(data);
+  };
+  H.skelData = mk(H.json);
+  /* variante con el segundo skin (hero-flip) para los enemigos */
+  try {
+    const alt = { default: (H.json.skins['hero-flip'] || H.json.skins.hero) };
+    H.skelAlt = mk({ skins: alt });
+  } catch (e) { H.skelAlt = null; }
+  /* retrato HUD desde la región de la cabeza */
+  try {
+    const r = findRegionRect(H.atlas, ['head', 'helmet', 'body']) ||
+              { x: 0, y: 0, w: Math.min(128, H.image.width), h: Math.min(128, H.image.height), rotate: false };
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d');
+    if (r.rotate) { x.translate(64, 0); x.rotate(Math.PI / 2);
+      x.drawImage(H.image, r.x, r.y, r.h, r.w, 0, 0, 64, 64); }
+    else x.drawImage(H.image, r.x, r.y, r.w, r.h, 0, 0, 64, 64);
+    H.portrait = c.toDataURL();
+  } catch (e) { H.portrait = null; }
+  return true;
+}
+function refreshGlobals() {
+  const main = hero.dash.skelData ? 'dash' : 'bogo';
+  skelData = hero[main].skelData;
+  portraitURL = hero[main].portrait;
+  G.assetsOK = !!(hero.bogo.skelData || hero.dash.skelData);
+}
+function onHeroReady(key) {
+  const H = hero[key];
+  if (!buildHero(key)) { updateAssetStatus(); return; }
+  refreshGlobals();
+  G.forceVector = false;
+  toast(H.imageName + ' · skeleton OK (' + (H.json.skeleton && H.json.skeleton.spine || '3.6') + ')');
+  rebuildShowcase(); updateAssetStatus(); refreshStartMode();
+}
+function ingestFile(file, forcedKey) {
   const n = file.name.toLowerCase();
+  const key = forcedKey || heroFromPath(file.webkitRelativePath || '') || guessKeyFromName(n) || 'bogo';
+  const H = hero[key];
   if (/\.(png|jpe?g|webp)$/.test(n)) {
     const img = new Image();
-    img.onload = () => { AssetIn.image = img; AssetIn.imageName = file.name; tryBuildSkeleton(); };
+    img.onload = () => { H.image = img; H.imageName = file.name; onHeroReady(key); };
+    img.onerror = () => toast('No se pudo leer la imagen: ' + file.name);
     img.src = URL.createObjectURL(file); return;
   }
   const r = new FileReader();
   r.onload = () => {
     const kind = classifyFile(file.name, r.result);
-    if (kind === 'json') { try { AssetIn.json = JSON.parse(r.result); } catch (e) { toast('JSON inválido: ' + file.name); return; } }
-    else if (kind === 'atlas') AssetIn.atlas = r.result;
+    if (kind === 'json') {
+      try { H.json = JSON.parse(r.result); } catch (e) { toast('JSON inválido: ' + file.name); return; }
+    } else if (kind === 'atlas') H.atlas = r.result;
     else { toast('Archivo no reconocido: ' + file.name); return; }
-    tryBuildSkeleton();
+    if (H.json && H.atlas && H.image) onHeroReady(key); else updateAssetStatus();
   };
   r.readAsText(file);
 }
-function tryBuildSkeleton() {
-  if (!(AssetIn.json && AssetIn.atlas && AssetIn.image)) { updateAssetStatus(); return; }
-  if (!G.spineOK || !gl || glLost) { updateAssetStatus(); return; }
-  try {
-    const j = AssetIn.json;
-    // El skin real es "hero"; "default" viene vacío. Lo unificamos para que
-    // las timelines de deform ("default") resuelvan en cualquier runtime 3.6.
-    if (j.skins && j.skins.hero && (!j.skins.default || !Object.keys(j.skins.default).length))
-      j.skins = { default: j.skins.hero };
-    if (!glTexture) glTexture = new spine.webgl.GLTexture(gl, AssetIn.image);
-    const atlas = new spine.TextureAtlas(AssetIn.atlas, () => glTexture);
-    const loader = new spine.AtlasAttachmentLoader(atlas);
-    const sj = new spine.SkeletonJson(loader); sj.scale = 1;
-    skelData = sj.readSkeletonData(j);
-    G.assetsOK = true; G.forceVector = false;
-    portraitURL = makePortrait();
-    toast('Assets Spine cargados ✓ (' + (j.skeleton && j.skeleton.spine || '3.6') + ')');
-    rebuildShowcase();
-  } catch (e) {
-    console.error(e); G.assetsOK = false; skelData = null;
-    toast('No se pudo construir el skeleton: ' + e.message);
-  }
-  updateAssetStatus(); refreshStartMode();
+function heroFromPath(p) { const k = heroFromName(p); return k; }
+function guessKeyFromName(n) {
+  /* sin carpeta ni nombre claro: decide por tamaño del atlas/png */
+  return null;
 }
-function makePortrait() {
-  try {
-    const m = AssetIn.atlas.match(/^head\s*\nrotate:\s*(\w+)\s*\nxy:\s*(\d+),\s*(\d+)\s*\nsize:\s*(\d+),\s*(\d+)/m);
-    const c = document.createElement('canvas'); c.width = c.height = 64;
-    const x = c.getContext('2d');
-    if (m) x.drawImage(AssetIn.image, +m[2], +m[3], +m[4], +m[5], 0, 0, 64, 64);
-    else x.drawImage(AssetIn.image, 0, 0, 128, 128, 0, 0, 64, 64);
-    return c.toDataURL();
-  } catch (e) { return null; }
+function ingestAll(files, forcedKey) { [...files].forEach(f => ingestFile(f, forcedKey)); }
+
+function pendingCount(key) {
+  const H = hero[key];
+  return ['json', 'atlas', 'image'].filter(k => H[k]).length;
 }
 function updateAssetStatus() {
-  const st = $('assetStatus');
-  const have = ['json', 'atlas', 'image'].filter(k => AssetIn[k]).length;
-  if (G.assetsOK) { st.textContent = '✓ Skeleton listo — ' + AssetIn.imageName; st.className = 'status ok'; }
-  else if (have > 0) { st.textContent = `Recibidos ${have}/3 archivos…` + (!G.spineOK ? ' (esperando runtime)' : ''); st.className = 'status'; }
-  else { st.textContent = 'No detectados en assets/ — arrástralos o usa el botón'; st.className = 'status err'; }
+  HEROES.forEach(h => {
+    const st = $('st' + h.slot), dz = $('drop' + h.slot);
+    if (!st) return;
+    const H = hero[h.key], ready = !!H.skelData;
+    if (dz) dz.classList.toggle('ok', ready);
+    if (ready) {
+      const an = Object.keys(H.skelData.animations || {}).length ||
+        (H.skelData.animations ? H.skelData.animations.length : 0);
+      st.textContent = `✓ ${h.label}: skeleton listo (${an} anims)`; st.className = 'status ok';
+    } else {
+      const have = pendingCount(h.key);
+      st.textContent = have > 0 ? `${have}/3 archivos recibidos…` + (!G.spineOK ? ' (esperando runtime)' : '')
+        : `Buscando en ${h.dir}…`;
+      st.className = 'status' + (G.spineOK && have === 0 ? ' err' : '');
+    }
+  });
+  const rt = $('rtStatus');
+  if (rt && G.spineOK && !G.assetsOK) { rt.textContent = 'Runtime Spine 3.6 ✓ — faltan archivos'; }
+}
+async function loadTrio(h) {
+  const b = h.dir + h.file;
+  const getTxt = async u => { const r = await fetch(u, { cache: 'no-store' }); return r.ok ? r.text() : null; };
+  const atlas = (await getTxt(b + '.atlas')) || (await getTxt(b + '.atlas.txt'));
+  const jsonTxt = await getTxt(b + '.json');
+  const rr = await fetch(b + '.png', { cache: 'no-store' });
+  const blob = rr.ok ? await rr.blob() : null;
+  if (!atlas || !jsonTxt || !blob) return false;
+  const H = hero[h.key];
+  H.atlas = atlas;
+  try { H.json = JSON.parse(jsonTxt); } catch (e) { return false; }
+  H.imageName = h.file + '.png';
+  await new Promise(res => {
+    const img = new Image();
+    img.onload = () => { H.image = img; res(); }; img.onerror = () => res();
+    img.src = URL.createObjectURL(blob);
+  });
+  if (!H.image) return false;
+  onHeroReady(h.key);
+  return true;
 }
 async function autoDetect() {
   if (location.protocol === 'file:') { updateAssetStatus(); return; }
-  const base = 'assets/unit-DEFAULT-untrimmed-smallcombat';
-  try {
-    const [j, a] = await Promise.all([
-      fetch(base + '.json').then(r => r.ok ? r.json() : Promise.reject()),
-      fetch(base + '.atlas').then(r => r.ok ? r.text() : fetch(base + '.atlas.txt').then(r2 => r2.ok ? r2.text() : Promise.reject()))
-    ]);
-    const blob = await fetch(base + '.png').then(r => r.ok ? r.blob() : Promise.reject());
-    AssetIn.json = j; AssetIn.atlas = a; AssetIn.imageName = 'unit-DEFAULT…png';
-    const img = new Image();
-    img.onload = () => { AssetIn.image = img; tryBuildSkeleton(); };
-    img.src = URL.createObjectURL(blob);
-  } catch (e) { updateAssetStatus(); }
+  for (const h of HEROES) { try { await loadTrio(h); } catch (e) { /* sigue con el siguiente */ } }
+  updateAssetStatus(); refreshStartMode();
 }
-function useSpine() { return G.spineOK && G.assetsOK && skelData && !G.forceVector && !glLost; }
+/* ── acceso al esqueleto de una unidad ── */
+function skelFor(u) {
+  const k = (u && u.asset) || 'bogo';
+  const H = hero[k] || hero.bogo;
+  if (!H || !H.skelData) return null;
+  return (u && u.side === 1 && H.skelAlt) ? H.skelAlt : H.skelData;
+}
+function hasAnim(u, n) {
+  const sd = skelFor(u); if (!sd || !u || !u.sk) return false;
+  if (sd.findAnimation(n)) return true;
+  const al = ANIM_ALIASES[n];
+  if (al) for (const a of al) if (sd.findAnimation(a)) return true;
+  return false;
+}
+function resolveAnim(u, n) {
+  const sd = skelFor(u); if (!sd) return null;
+  if (sd.findAnimation(n)) return n;
+  const al = ANIM_ALIASES[n];
+  if (al) for (const a of al) if (sd.findAnimation(a)) return a;
+  return null;
+}
+function useSpine() { return G.spineOK && G.assetsOK && !!skelData && !G.forceVector && !glLost; }
 function refreshStartMode() { $('startMode').textContent = useSpine() ? 'SPINE' : 'VECTOR'; }
 
 /* ── luchador vector (fallback completo) ── */
@@ -464,24 +631,26 @@ function rr(ctx, x, y, w, h, r) {
 }
 
 /* ── unidades ── */
+/* asset: «bogo» (guardián/tanque) o «dash» (velocista/DPS) */
 const PLAYER_DEFS = [
-  { name: 'BOGO',          tint: [1, 1, 1] },
-  { name: 'BOGO TÁCTICO',  tint: [.72, .92, 1] },
-  { name: 'BOGO VETERANO', tint: [1, .9, .68] }
+  { name: 'BOGO',          tint: [1, 1, 1],      asset: 'bogo' },
+  { name: 'DASH',          tint: [1, 1, 1],      asset: 'dash' },
+  { name: 'BOGO VETERANO', tint: [1, .9, .68],   asset: 'bogo' }
 ];
 const WAVE_DEFS = [
-  [['MATÓN', [1, .62, .62]], ['BUSCAPLEITOS', [.85, .68, 1]], ['BRAVUCÓN', [1, .78, .55]]],
-  [['SICARIO', [1, .55, .55]], ['GRANADERO', [.8, .6, 1]], ['CAPITÁN', [1, .72, .45]]],
-  [['TENIENTE', [1, .5, .5]], ['COMISARIO', [.78, .55, 1]], ['JEFE RENEGADO', [1, .62, .3]]]
+  [['MATÓN', [1, .62, .62], 'dash'], ['BUSCAPLEITOS', [.85, .68, 1], 'bogo'], ['BRAVUCÓN', [1, .78, .55], 'dash']],
+  [['SICARIO', [1, .55, .55], 'dash'], ['GRANADERO', [.8, .6, 1], 'bogo'], ['CAPITÁN', [1, .72, .45], 'bogo']],
+  [['TENIENTE', [1, .5, .5], 'dash'], ['COMISARIO', [.78, .55, 1], 'bogo'], ['JEFE RENEGADO', [1, .62, .3], 'bogo']]
 ];
 const DIFF = { easy: { hp: .8, dmg: .72 }, normal: { hp: 1, dmg: 1 }, hard: { hp: 1.25, dmg: 1.3 } };
 let uid = 0;
 
-function makeUnit(side, slot, name, tint) {
+function makeUnit(side, slot, name, tint, asset) {
   const d = DIFF[G.difficulty];
   const lvlP = 1 + .06 * (G.level - 1), lvlE = 1 + .15 * (G.level - 1) + .22 * (G.wave - 1);
+  const key = hero[asset] ? asset : 'bogo';
   const u = {
-    id: uid++, side, slot, name, tint, facing: side === 0 ? 1 : -1,
+    id: uid++, side, slot, name, tint, asset: key, facing: side === 0 ? 1 : -1,
     maxHp: Math.round(side === 0 ? 920 * lvlP : 640 * lvlE * d.hp),
     dmg: (side === 0 ? 86 * lvlP : 54 * (1 + .1 * (G.level - 1) + .12 * (G.wave - 1)) * d.dmg),
     energy: side === 0 ? 20 : 0, atkT: rand(1, 2.2), atkPeriod: side === 0 ? 2.6 : 2.9,
@@ -491,27 +660,32 @@ function makeUnit(side, slot, name, tint) {
     sk: null, as: null
   };
   u.hp = u.maxHp;
-  if (useSpine()) {
-    try {
-      u.sk = new spine.Skeleton(skelData);
-      u.sk.setSkinByName('default'); u.sk.setToSetupPose(); u.sk.updateWorldTransform();
-      const ad = new spine.AnimationStateData(skelData); ad.defaultMix = .16;
-      u.as = new spine.AnimationState(ad);
-      playAnim(u, 'entrance_loop', true);
-    } catch (e) { u.sk = null; u.as = null; }
-  }
+  attachSpine(u);
   return u;
 }
-function hasAnim(u, n) { return u.sk && skelData.findAnimation(n); }
+/* crea Skeleton + AnimationState a partir del esqueleto asignado a la unidad */
+function attachSpine(u) {
+  u.sk = null; u.as = null;
+  if (!useSpine()) return;
+  const sd = skelFor(u); if (!sd) return;
+  try {
+    u.sk = new spine.Skeleton(sd);
+    try { u.sk.setSkinByName('default'); } catch (e) {}
+    u.sk.setToSetupPose(); u.sk.updateWorldTransform();
+    const ad = new spine.AnimationStateData(sd); ad.defaultMix = .16;
+    u.as = new spine.AnimationState(ad);
+    playAnim(u, 'entrance_loop', true);
+  } catch (e) { u.sk = null; u.as = null; console.error(e); }
+}
 function playAnim(u, n, loop) {
-  if (!u.as) return;
-  if (!hasAnim(u, n)) n = hasAnim(u, 'idle') ? 'idle' : null;
-  if (n) u.as.setAnimation(0, n, loop);
+  if (!u || !u.as) return;
+  const r = resolveAnim(u, n) || (resolveAnim(u, 'idle') ? 'idle' : null);
+  if (r) u.as.setAnimation(0, r, !!loop);
 }
 function queueAnim(u, n, loop, delay) {
-  if (!u.as) return;
-  if (!hasAnim(u, n)) n = 'idle';
-  if (hasAnim(u, n)) u.as.addAnimation(0, n, loop, delay || 0);
+  if (!u || !u.as) return;
+  const r = resolveAnim(u, n) || resolveAnim(u, 'idle');
+  if (r) u.as.addAnimation(0, r, !!loop, delay || 0);
 }
 function layoutUnits() {
   const gy = groundY();
@@ -622,7 +796,7 @@ function spawnWave(n) {
   G.units = G.units.filter(u => u.side === 0);
   const defs = WAVE_DEFS[n - 1];
   for (let i = 0; i < 3; i++) {
-    const u = makeUnit(1, i, defs[i][0], defs[i][1]);
+    const u = makeUnit(1, i, defs[i][0], defs[i][1], defs[i][2]);
     G.units.push(u);
   }
   layoutUnits();
@@ -636,7 +810,7 @@ function startBattle() {
   G.stats = { dmg: 0, ults: 0, t0: performance.now() };
   G.units = [];
   for (let i = 0; i < 3; i++) {
-    const u = makeUnit(0, i, PLAYER_DEFS[i].name, PLAYER_DEFS[i].tint);
+    const u = makeUnit(0, i, PLAYER_DEFS[i].name, PLAYER_DEFS[i].tint, PLAYER_DEFS[i].asset);
     G.units.push(u);
   }
   spawnWave(1);
@@ -761,9 +935,13 @@ function renderSpine(units, t) {
   shader.setUniformi(spine.webgl.Shader.SAMPLER, 0);
   shader.setUniform4x4f(spine.webgl.Shader.MVP_MATRIX, mvp.values);
   batcher.begin(shader);
+  let bound = null, tex = null;
   for (const u of units) {
     if (!u.sk || !u.as) continue;
     if (!u.alive && u.stateT > 2.6) continue;
+    const hv = hero[u.asset] || hero.bogo;
+    tex = hv && hv.tex ? hv.tex : glTexture;         /* textura del héroe correcto */
+    if (tex && tex !== bound) { tex.bind(0); bound = tex; }
     u.as.apply(u.sk); u.sk.updateWorldTransform();
     const flip = G.flipAll ? -1 : 1;
     u.sk.x = u.x + u.lunge; u.sk.y = H - u.y;
@@ -779,36 +957,49 @@ function renderSpine(units, t) {
   batcher.end(); shader.unbind();
 }
 
-/* ── showcase (menú) ── */
+/* ── showcase (menú): BOGO y DASH lado a lado ── */
 const SHOW_SEQ = [['idle', 3.5], ['walk', 2.2], ['attack', 1.1], ['skill1', 2], ['idle', 1.5],
   ['victory_start', 1.5], ['victory_loop', 2.6], ['idle', 2]];
-const showU = { sk: null, as: null, x: 0, y: 0, h: 300, scale: .4, facing: 1, tint: [1, 1, 1],
-  alive: true, state: 'idle', stateT: 0, flashT: 0, lunge: 0, buffs: { shield: 0, stun: 0 }, id: 999 };
+function mkShow(asset) {
+  return { sk: null, as: null, asset, x: 0, y: 0, h: 300, scale: .4, facing: 1, tint: [1, 1, 1],
+    alive: true, state: 'idle', stateT: 0, flashT: 0, lunge: 0, side: 0,
+    buffs: { shield: 0, stun: 0 }, id: 999 };
+}
+const showU = mkShow('bogo'), showU2 = mkShow('dash');
+const SHOW_LIST = [showU, showU2];
 let showIdx = 0, showT = 0, showOverride = 0;
 function rebuildShowcase() {
-  showU.sk = null; showU.as = null;
-  if (useSpine()) {
+  for (const s of SHOW_LIST) {
+    s.sk = null; s.as = null;
+    if (!useSpine()) continue;
+    const sd = skelFor(s); if (!sd) continue;
     try {
-      showU.sk = new spine.Skeleton(skelData);
-      showU.sk.setSkinByName('default'); showU.sk.setToSetupPose();
-      const ad = new spine.AnimationStateData(skelData); ad.defaultMix = .18;
-      showU.as = new spine.AnimationState(ad);
-      showU.as.setAnimation(0, 'idle', true);
-    } catch (e) { showU.sk = null; }
+      s.sk = new spine.Skeleton(sd);
+      try { s.sk.setSkinByName('default'); } catch (e) {}
+      s.sk.setToSetupPose(); s.sk.updateWorldTransform();
+      const ad = new spine.AnimationStateData(sd); ad.defaultMix = .18;
+      s.as = new spine.AnimationState(ad);
+      playAnim(s, 'idle', true);
+    } catch (e) { s.sk = null; s.as = null; }
   }
   showIdx = 0; showT = 0;
 }
 function layoutShowcase() {
-  const mobile = W < 820;
-  showU.x = mobile ? W * .5 : W * .66;
-  showU.y = mobile ? H * .34 : groundY();
-  showU.h = mobile ? H * .27 : clamp(H * .52, 220, 460);
-  showU.scale = showU.h / 788;
+  const mobile = W < 820, both = !!(showU.sk && showU2.sk);
+  const gap = mobile ? W * .22 : W * .13;
+  const cx = mobile ? W * .5 : W * .66;
+  SHOW_LIST.forEach((s, i) => {
+    const off = both ? (i === 0 ? -gap / 2 : gap / 2) : 0;
+    s.x = clamp(cx + off, 70, W - 70);
+    s.y = mobile ? H * .34 : groundY();
+    s.h = (mobile ? H * .27 : clamp(H * .52, 220, 460)) * (both && i === 1 ? .92 : 1);
+    s.scale = s.h / 788;
+  });
 }
 function updateShowcase(dt, t) {
   showT += dt; showU.stateT += dt;
   if (showOverride > 0) { showOverride -= dt;
-    if (showOverride <= 0) { showU.state = 'idle'; if (showU.as) showU.as.setAnimation(0, 'idle', true); } }
+    if (showOverride <= 0) { showU.state = 'idle'; playAnim(showU, 'idle', true); playAnim(showU2, 'idle', true); } }
   else {
     const [name, dur] = SHOW_SEQ[showIdx];
     if (showT >= dur) {
@@ -817,15 +1008,17 @@ function updateShowcase(dt, t) {
       showU.state = n === 'attack' ? 'attack' : n === 'skill1' ? 'skill' : n.startsWith('victory') ? 'victory' : n === 'walk' ? 'enter' : 'idle';
       showU.stateT = 0;
       $('showAnim').textContent = n;
-      if (showU.as && hasAnim(showU, n)) showU.as.setAnimation(0, n, !['attack', 'skill1', 'victory_start'].includes(n));
+      const loop = !['attack', 'skill1', 'victory_start'].includes(n);
+      playAnim(showU, n, loop); playAnim(showU2, n, loop);
     }
   }
-  if (showU.as) showU.as.update(dt);
+  for (const s of SHOW_LIST) if (s.as) s.as.update(dt);
 }
 function pokeShowcase() {
   showOverride = 1.1; showU.state = 'attack'; showU.stateT = 0;
   $('showAnim').textContent = 'attack';
-  if (showU.as && hasAnim(showU, 'attack')) { showU.as.setAnimation(0, 'attack', false); showU.as.addAnimation(0, 'idle', true, 0); }
+  playAnim(showU, 'attack', false); queueAnim(showU, 'idle', true, 0);
+  playAnim(showU2, 'attack', false); queueAnim(showU2, 'idle', true, 0);
   AudioSys.hit(false);
   sparks(showU.x, showU.y - showU.h * .55, '#ffd76a', 10, 180);
 }
@@ -839,7 +1032,8 @@ function buildCards() {
     b.className = 'card'; b.dataset.i = i;
     b.setAttribute('aria-label', 'Ulti de ' + u.name);
     const face = document.createElement('div'); face.className = 'card-face';
-    if (portraitURL && useSpine()) { const img = document.createElement('img'); img.src = portraitURL; img.alt = ''; face.appendChild(img); }
+    const P = hero[u.asset] || hero.bogo;
+    if (P && P.portrait && useSpine()) { const img = document.createElement('img'); img.src = P.portrait; img.alt = ''; face.appendChild(img); }
     else { const c = document.createElement('canvas'); c.width = c.height = 64;
       const x = c.getContext('2d'); x.translate(32, 78); x.scale(.32, .32);
       drawVector(x, Object.assign({}, u, { x: 0, y: 0, h: 300, facing: 1, state: 'idle', stateT: 0, lunge: 0 }), 0);
@@ -926,14 +1120,33 @@ $('diffRow').addEventListener('click', e => {
 });
 [...$('diffRow').children].forEach(x => x.classList.toggle('on', x.dataset.d === G.difficulty));
 
-/* ── entrada de archivos ── */
-$('btnFiles').onclick = () => $('fileInput').click();
-$('fileInput').onchange = e => { [...e.target.files].forEach(ingestFile); e.target.value = ''; };
-window.addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('over'); });
-window.addEventListener('dragleave', e => { if (!e.relatedTarget) $('drop').classList.remove('over'); });
+/* ── entrada de archivos: un trío (json + atlas + png) por héroe ── */
+let activeSlot = 0;
+const slots = [...document.querySelectorAll('.drop-slot')];
+slots.forEach((dz, i) => {
+  const idx = dz.id.replace(/\D+/, '') || String(i);
+  dz.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation(); dz.classList.remove('over');
+    const def = HEROES[+idx] || HEROES[i];
+    if (e.dataTransfer && e.dataTransfer.files) ingestAll(e.dataTransfer.files, def.key);
+  });
+});
+document.querySelectorAll('.drop-slot .btn').forEach(b => {
+  b.onclick = () => {
+    activeSlot = +b.dataset.slot || 0;
+    const def = HEROES[activeSlot] || HEROES[0];
+    const inp = $('fileInput');
+    inp.value = '';
+    inp.onchange = e => { ingestAll(e.target.files, def.key); };
+    inp.click();
+  };
+});
+window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('drop', e => {
-  e.preventDefault(); $('drop').classList.remove('over');
-  if (e.dataTransfer && e.dataTransfer.files) [...e.dataTransfer.files].forEach(ingestFile);
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) ingestAll(e.dataTransfer.files);
 });
 
 /* ── teclado + puntero ── */
@@ -986,7 +1199,8 @@ function frame(now) {
   } else {
     updateShowcase(dt, t);
     updateFX(dt);
-    if (useSpine() && showU.sk) renderSpine([showU], t);
+    const anySk = SHOW_LIST.some(s => s.sk);
+    if (useSpine() && anySk) renderSpine(SHOW_LIST.filter(s => s.sk), t);
     else {
       if (gl && !glLost) { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
       drawVector(fxX, showU, t);
